@@ -27,6 +27,8 @@ def mux_mp4(
         raise ValueError(f"expected audio [1,2,S], got {audio.shape}")
     if fps < 1 or sample_rate < 1:
         raise ValueError("fps and sample_rate must be positive")
+    if not 0 <= crf <= 51:
+        raise ValueError(f"crf must be in 0-51 (x264 range), got {crf}")
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg is required to write MP4 output")

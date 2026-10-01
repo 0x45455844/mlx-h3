@@ -110,6 +110,13 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="append a standalone audio reference at this point",
     )
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=18,
+        help="x264 constant rate factor for the written MP4 (0-51, lower = better and "
+        "bigger; default 18)",
+    )
     parser.add_argument("--budget", type=int, default=memory.BUDGET_GIB)
     parser.add_argument("--tokenizer", default=pipeline.ModelPaths.tokenizer)
     parser.add_argument("--text-encoder", default=pipeline.ModelPaths.text_encoder)
@@ -225,6 +232,7 @@ def main() -> int:
         media.audio,
         fps=media.fps,
         sample_rate=media.sample_rate,
+        crf=args.crf,
     )
     guard.check("output written")
     print(
