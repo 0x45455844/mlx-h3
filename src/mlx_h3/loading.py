@@ -72,6 +72,7 @@ def load_dit(
     adapter_path: str | Path | None = None,
     adapter_strength: float = 1.0,
     nax_group_size: int | None = None,
+    sparse: "sparse.SparseTable | None" = None,
 ) -> MiniMaxH3:
     header, metadata = read_header(path)
     model = prepare(MiniMaxH3(config), header, metadata)
@@ -100,6 +101,8 @@ def load_dit(
         model.precompute_adaln(plans, dtype=modulation_dtype)
     if nax_group_size is not None:
         nax.convert_dit(model, group_size=nax_group_size)
+    if sparse is not None:
+        model.set_sparse(sparse)
     # Materialize now rather than on first use: mx.load is lazy, and letting the
     # weights fault in mid-step is exactly the paging this project must avoid.
     mx.eval(model.parameters())

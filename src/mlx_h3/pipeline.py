@@ -25,6 +25,7 @@ from . import (
     memory,
     model as h3_model,
     sampler,
+    sparse,
     text_encoder,
     tokenizer,
 )
@@ -134,8 +135,20 @@ class GenerationConfig:
     last_frame: str | Path | None = None
     references: tuple[Reference, ...] = ()
     ref_image_size: media.ReferenceImageSize = "match"
+    sparse_bundle: str | Path | None = None
+    sparse_keep: float | None = None
+    sparse_dense_layers: tuple[int, ...] = ()
+    sparse_head_chunk: int = sparse.HEAD_CHUNK
 
     def __post_init__(self) -> None:
+        if self.sparse_bundle is not None:
+            if self.sparse_keep is not None and not 0.0 < self.sparse_keep <= 1.0:
+                raise ValueError(f"sparse_keep must be in (0, 1], got {self.sparse_keep}")
+            if not 1 <= self.sparse_head_chunk <= 56:
+                raise ValueError(f"sparse_head_chunk must be in [1, 56], got {self.sparse_head_chunk}")
+            for layer in self.sparse_dense_layers:
+                if int(layer) < 0:
+                    raise ValueError("sparse_dense_layers must be non-negative layer indices")
         if not isinstance(self.prompt, str):
             raise ValueError("prompt must be a string")
         if self.width < 32 or self.height < 32:
@@ -196,6 +209,7 @@ class GeneratedMedia:
     seed: int
     prompt_tokens: int
     sequence_length: int
+    sparse_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +275,7 @@ def generate(
     nax_group_size: int | None = None,
     on_step: Callable[[int, int, float, float], None] | None = None,
     on_report: Callable[[PhaseReport], None] | None = None,
+    on_note: Callable[[str], None] | None = None,
 ) -> GeneratedMedia:
     """Run generation with exactly one resident model per phase."""
     ref2va = bool(config.references)
@@ -534,6 +549,33 @@ def generate(
         )
     )
 
+    sparse_table: sparse.SparseTable | None = None
+    sparse_note: str | None = None
+    if config.sparse_bundle is not None:
+        bundle = sparse.Bundle.load(config.sparse_bundle)
+        sparse_table, notes = sparse.build_table(
+            bundle,
+            width=config.width,
+            height=config.height,
+            grid=(latent_t, latent_h // h3_model.H3Config().patch_size[1], latent_w // h3_model.H3Config().patch_size[2]),
+            video_start=next(s.start for s in packed.segments if s.kind == "video"),
+            num_layers=bundle.num_layers,
+            heads=bundle.metadata.get("num_heads") or 56,
+            keep_ratio=config.sparse_keep,
+            dense_layers=config.sparse_dense_layers,
+            head_chunk=config.sparse_head_chunk,
+        )
+        kept, video_tiles = sparse_table.kept_tiles()
+        sparse_note = (
+            f"{sparse_table.sparse_layers}/{len(sparse_table.blocks)} layers sparse · plan "
+            f"{sparse_table.geometry} · keep {sparse_table.keep_ratio:.0%} · "
+            f"{kept} of {video_tiles + sparse_table.blocks[0].groups[0].n_global} video key tiles per query tile"
+        )
+        if on_note is not None:
+            on_note(f"sparse attention: {sparse_note}")
+            for note in notes:
+                on_note(f"  note: {note}")
+
     def run_dit(model):
         refined_text = model.refine_text(text_states)
         mx.eval(refined_text)
@@ -560,6 +602,7 @@ def generate(
             modulation_dtype=text_states.dtype,
             adapter_path=paths.turbo_lora,
             nax_group_size=nax_group_size,
+            sparse=sparse_table,
         ),
         run_dit,
         guard,
@@ -605,4 +648,5 @@ def generate(
         seed=config.seed,
         prompt_tokens=text_length,
         sequence_length=packed.seq_len,
+        sparse_note=sparse_note,
     )

@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import dit, layout
+from . import dit, layout, sparse
 from .layout import PackedLayout
 from .rope import angles as rope_angles
 from .rope import tables as rope_tables
@@ -221,10 +221,23 @@ class MiniMaxH3(nn.Module):
             cfg.final_norm_eps,
         )
         self._adaln_schedule: AdalnSchedule | None = None
+        self._sparse: sparse.SparseTable | None = None
 
     @property
     def has_precomputed_adaln(self) -> bool:
         return self._adaln_schedule is not None
+
+    def set_sparse(self, table: sparse.SparseTable | None) -> None:
+        """Attach the block-sparse plan for the generation about to run.
+
+        Like the AdaLN schedule, it is per-generation state rather than an argument
+        of the step: it depends on the packed sequence, which never changes inside a
+        run, and threading it through the sampler would put a rendering concern in
+        the solver's signature.
+        """
+        if table is not None and len(table.blocks) != len(self.blocks):
+            raise ValueError(f"sparse table covers {len(table.blocks)} layers, trunk has {len(self.blocks)}")
+        self._sparse = table
 
     def precompute_adaln(
         self,
@@ -389,6 +402,7 @@ class MiniMaxH3(nn.Module):
         h = self.embed(packed, text_embed, video_rows, audio_rows)
         for i, block in enumerate(self.blocks):
             modulation = None if schedule is None else schedule.blocks[i][step_index]
+            sparse_layer = None if self._sparse is None else self._sparse.blocks[i]
             h = block(
                 h,
                 t_emb,
@@ -396,6 +410,7 @@ class MiniMaxH3(nn.Module):
                 cos,
                 sin,
                 modulation=modulation,
+                sparse=sparse_layer,
             )
             # Force materialization per block: otherwise the lazy graph holds all
             # 50 blocks' intermediates alive at once, which at spec size is tens

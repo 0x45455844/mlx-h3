@@ -6,7 +6,7 @@ import argparse
 import time
 from pathlib import Path
 
-from . import memory, output, pipeline, sampler
+from . import memory, output, pipeline, sampler, sparse
 
 
 class _ReferenceAction(argparse.Action):
@@ -139,6 +139,34 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=(64, 256, 448, 896),
         help="experimental M5 W8A8 DiT group size; default keeps MLX W8A16",
     )
+    parser.add_argument(
+        "--sparse-attn",
+        metavar="BUNDLE",
+        default=None,
+        help=(
+            "Veda tile-score predictor bundle; turns on block-sparse attention over the "
+            "video quadrant (global text/audio/anchor rows stay dense). Any canvas and "
+            "any lane runs: an untrained geometry falls back to the nearest plan with a note."
+        ),
+    )
+    parser.add_argument(
+        "--sparse-keep",
+        type=float,
+        default=None,
+        help="fraction of video key tiles to keep (default: the bundle's, usually 0.1)",
+    )
+    parser.add_argument(
+        "--sparse-dense-layers",
+        default="",
+        metavar="LIST",
+        help="comma-separated trunk layer indices to keep dense (default: none)",
+    )
+    parser.add_argument(
+        "--sparse-head-chunk",
+        type=int,
+        default=sparse.HEAD_CHUNK,
+        help="heads computed per gathered block; lower it if the canvas is huge",
+    )
     return parser
 
 
@@ -187,6 +215,12 @@ def main() -> int:
         last_frame=args.last_frame,
         references=tuple(args.references or ()),
         ref_image_size=args.ref_image_size,
+        sparse_bundle=args.sparse_attn,
+        sparse_keep=args.sparse_keep,
+        sparse_dense_layers=tuple(
+            int(value) for value in args.sparse_dense_layers.split(",") if value.strip()
+        ),
+        sparse_head_chunk=args.sparse_head_chunk,
     )
     try:
         paths.validate(ref2va=bool(config.references))
@@ -225,6 +259,7 @@ def main() -> int:
         nax_group_size=args.nax_group_size,
         on_step=progress,
         on_report=report,
+        on_note=lambda text: print(f"{text}", flush=True),
     )
     destination = output.mux_mp4(
         args.output,
@@ -240,6 +275,8 @@ def main() -> int:
         f"elapsed {(time.perf_counter() - started) / 60:.1f} min",
         flush=True,
     )
+    if media.sparse_note:
+        print(f"  sparse: {media.sparse_note}", flush=True)
     return 0
 
 

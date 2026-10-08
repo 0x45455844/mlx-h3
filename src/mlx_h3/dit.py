@@ -20,6 +20,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from . import rope
+from .sparse import LayerAttention
 
 #: (start, stop, modulation row) covering the packed sequence contiguously.
 Runs = list[tuple[int, int, int]]
@@ -125,6 +126,12 @@ class Attention(nn.Module):
 
     Video, audio and text all see each other; that joint attention is the whole
     mechanism by which the two modalities stay in sync.
+
+    ``sparse`` replaces the dense call with the Veda tile path: the video -> video
+    quadrant attends its per-head top-k tiles, everything global stays dense, and the
+    gathered block is served by the same fused dense kernel. With ``sparse`` unset --
+    the default, and what every keeper renders with -- the code below is byte-for-byte
+    the attention this fork has always run.
     """
 
     def __init__(self, hidden: int, heads: int, head_dim: int, eps: float):
@@ -140,7 +147,12 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(inner, hidden, bias=False)
 
     def __call__(
-        self, x: mx.array, cos: mx.array | None = None, sin: mx.array | None = None
+        self,
+        x: mx.array,
+        cos: mx.array | None = None,
+        sin: mx.array | None = None,
+        *,
+        sparse: LayerAttention | None = None,
     ) -> mx.array:
         s = x.shape[0]
         q, k, v = mx.split(self.qkv_proj(x), 3, axis=-1)
@@ -154,6 +166,10 @@ class Attention(nn.Module):
         if cos is not None:
             q = rope.apply(q, cos, sin)
             k = rope.apply(k, cos, sin)
+
+        if sparse is not None:
+            out = sparse.attention(q, k, v.reshape(shape))
+            return self.out_proj(mx.transpose(out, (1, 0, 2)).reshape(s, -1))
 
         q, k, v = (mx.transpose(t, (1, 0, 2))[None] for t in (q, k, v.reshape(shape)))
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
@@ -248,6 +264,7 @@ class DiTBlock(nn.Module):
         sin: mx.array | None = None,
         *,
         modulation: BlockModulation | None = None,
+        sparse: LayerAttention | None = None,
     ) -> mx.array:
         if modulation is None:
             if self.adaln_proj is None or t_emb is None:
@@ -255,7 +272,7 @@ class DiTBlock(nn.Module):
             modulation = tuple(self.adaln_proj(t_emb))
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = modulation
         h = modulate(x, self.norm1.weight, self.eps, shift_a, scale_a, runs)
-        x = gate(x, gate_a, self.attn(h, cos, sin), runs)
+        x = gate(x, gate_a, self.attn(h, cos, sin, sparse=sparse), runs)
         h = modulate(x, self.norm2.weight, self.eps, shift_m, scale_m, runs)
         return gate(x, gate_m, self.mlp(h), runs)
 
