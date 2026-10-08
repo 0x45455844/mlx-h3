@@ -100,8 +100,8 @@ def test_main_wires_cli_configuration_through_generation_and_mux(
             sequence_length=17,
         )
 
-    def mux(path, frames, audio, *, fps, sample_rate):
-        calls["mux"] = (path, frames.shape, audio.shape, fps, sample_rate)
+    def mux(path, frames, audio, *, fps, sample_rate, crf=None):
+        calls["mux"] = (path, frames.shape, audio.shape, fps, sample_rate, crf)
         destination.touch()
         return destination
 
@@ -174,6 +174,7 @@ def test_main_wires_cli_configuration_through_generation_and_mux(
         (1, 2, 6400),
         24,
         32_000,
+        18,  # no --crf on argv, so the encoder stays at the engine default
     )
     assert calls["checks"] == ["output written"]
     assert "wrote" in capsys.readouterr().out
