@@ -141,14 +141,12 @@ class GenerationConfig:
     sparse_head_chunk: int = sparse.HEAD_CHUNK
 
     def __post_init__(self) -> None:
-        if self.sparse_bundle is not None:
-            if self.sparse_keep is not None and not 0.0 < self.sparse_keep <= 1.0:
-                raise ValueError(f"sparse_keep must be in (0, 1], got {self.sparse_keep}")
-            if not 1 <= self.sparse_head_chunk <= 56:
-                raise ValueError(f"sparse_head_chunk must be in [1, 56], got {self.sparse_head_chunk}")
-            for layer in self.sparse_dense_layers:
-                if int(layer) < 0:
-                    raise ValueError("sparse_dense_layers must be non-negative layer indices")
+        # No sparse validation here, on purpose. A frozen config raising ValueError on a
+        # keep_ratio it merely disapproves of is a REFUSE, and the owner's rule is that
+        # sparse never refuses -- "if it dies I'll come back and adjust" was said about
+        # exactly this. Ranges are normalized in sparse.build_table, which is the only
+        # place there is a note channel to say what it decided. keep > 1.0 is legal and
+        # means "keep every video key column": the wiring rung.
         if not isinstance(self.prompt, str):
             raise ValueError("prompt must be a string")
         if self.width < 32 or self.height < 32:
@@ -566,10 +564,11 @@ def generate(
             head_chunk=config.sparse_head_chunk,
         )
         kept, video_tiles = sparse_table.kept_tiles()
+        cover = sparse_table.coverage()[0]      # `need` is in build_table's own note
         sparse_note = (
             f"{sparse_table.sparse_layers}/{len(sparse_table.blocks)} layers sparse · plan "
-            f"{sparse_table.geometry} · keep {sparse_table.keep_ratio:.0%} · "
-            f"{kept} of {video_tiles + sparse_table.blocks[0].groups[0].n_global} video key tiles per query tile"
+            f"{sparse_table.geometry} · keep {sparse_table.keep_ratio:.0%} of work = "
+            f"{kept} of {video_tiles} video key tiles per query tile ({cover:.0%} of columns)"
         )
         if on_note is not None:
             on_note(f"sparse attention: {sparse_note}")

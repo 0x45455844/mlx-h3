@@ -153,7 +153,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sparse-keep",
         type=float,
         default=None,
-        help="fraction of video key tiles to keep (default: the bundle's, usually 0.1)",
+        help="fraction of the IDEAL dense video attention work to keep (default: the "
+        "bundle's, usually 0.1). NOT a fraction of columns: on a padded grid 1.0 still "
+        "drops columns, and the run's real column coverage is printed in the sparse note. "
+        "Above 1.0 every video key column is kept, which makes the run a wiring test.",
     )
     parser.add_argument(
         "--sparse-dense-layers",

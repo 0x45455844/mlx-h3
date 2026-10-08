@@ -168,8 +168,13 @@ class Attention(nn.Module):
             k = rope.apply(k, cos, sin)
 
         if sparse is not None:
+            # `sparse.attention` already returns [s, heads, head_dim] -- the SAME layout
+            # as the un-transposed q/k/v above, not the [1, heads, s, head_dim] the dense
+            # branch gets back from the kernel. Transposing it here swaps the sequence and
+            # head axes, and because heads*seq*dim == seq*(heads*dim) the reshape cannot
+            # detect it: every token ships another token's value, at every keep_ratio.
             out = sparse.attention(q, k, v.reshape(shape))
-            return self.out_proj(mx.transpose(out, (1, 0, 2)).reshape(s, -1))
+            return self.out_proj(out.reshape(s, -1))
 
         q, k, v = (mx.transpose(t, (1, 0, 2))[None] for t in (q, k, v.reshape(shape)))
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)

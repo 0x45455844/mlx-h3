@@ -435,6 +435,29 @@ def budget_per_row(keep_ratio: float, video_tokens: int, n_video: int) -> float:
     return keep_ratio * n_ideal * n_ideal / max(n_video, 1)
 
 
+def dense_keep(video_tokens: int, n_video: int) -> float:
+    """Smallest keep_ratio that leaves no video key column unvisited.
+
+    Diagnostic knob, not a tuning knob: at this ratio every video query tile sees every
+    video key tile, so the sparse path computes the dense softmax through the gathered
+    layout. It costs MORE than dense and proves only that the gather/scatter/head
+    plumbing round-trips. Compare it with a dense render at the same seed.
+    """
+    return (n_video / math.ceil(video_tokens / TILE)) ** 2
+
+
+def columns_kept(keep_ratio: float, video_tokens: int, n_video: int) -> tuple[int, int]:
+    """(video key columns a query tile sees, video key columns there to see).
+
+    The honest coverage number. keep_ratio is a fraction of the IDEAL dense work, not
+    of the columns: on a padded grid `n_video` exceeds `ceil(tokens / TILE)`, so the
+    columns kept sit below keep_ratio and keep_ratio 1.0 is NOT dense. At the real
+    864x480/56f grid the plan pads 56%, and keep 1.0 buys 42% of the columns.
+    """
+    k_lo, k_hi, _ = split_budget(budget_per_row(keep_ratio, video_tokens, n_video), n_video)
+    return k_hi, n_video
+
+
 def split_budget(budget: float, n_cols: int) -> tuple[int, int, float]:
     """(k_lo, k_hi, frac): rows keep k_lo or k_hi tiles, `frac` of them k_hi."""
     if budget >= n_cols:
@@ -612,13 +635,37 @@ class SparseTable:
         return sum(block is not None for block in self.blocks)
 
     def kept_tiles(self) -> tuple[int, int]:
-        """(kept key tiles per query tile, video tiles) of the first sparse layer."""
+        """(key tiles a query tile sees, key tiles there are) for the first sparse layer.
+
+        Globals are counted on BOTH sides so the two numbers are comparable and the
+        first is never larger than the second. The old version added the globals twice
+        and reported ceil(budget), so it could claim more kept than there were.
+        """
         for block in self.blocks:
             if block is not None:
                 group = block.groups[0]
-                video = budget_per_row(block.keep_ratio, group.video_tokens, group.n_video)
-                return math.ceil(video) + group.n_global, group.n_video
+                kept, video = columns_kept(block.keep_ratio, group.video_tokens, group.n_video)
+                return kept + group.n_global, video + group.n_global
         return 0, 0
+
+    def coverage(self) -> tuple[float, float]:
+        """(worst column coverage, keep_ratio needed to reach 100%).
+
+        Reported because `keep 100%` in the banner would be a lie on any padded grid:
+        the budget is a fraction of the ideal dense work, and padding spends part of it
+        on tiles that hold no tokens. Coverage is the minimum over every sparse layer's
+        head groups, since the tightest group is the one that loses context first.
+        """
+        worst, need = 1.0, 0.0
+        for block in self.blocks:
+            if block is None:
+                continue
+            for group in block.groups:
+                kept, video = columns_kept(block.keep_ratio, group.video_tokens, group.n_video)
+                worst = min(worst, kept / video)
+                need = max(need, dense_keep(group.video_tokens, group.n_video))
+        return worst, need
+
 
 
 def build_table(
@@ -647,12 +694,45 @@ def build_table(
     plan, note = bundle.plans.select(width, height, grid)
     if not note.endswith("(exact)"):
         warnings.append(note)
-    keep = bundle.keep_ratio if keep_ratio is None else float(keep_ratio)
-    if keep >= 1.0:
-        warnings.append(f"keep_ratio {keep} keeps every tile: sparse attention is a no-op here")
-    dense = tuple(sorted({int(layer) for layer in dense_layers}))
-    if len(dense) != len(set(dense)) or any(not 0 <= layer < num_layers for layer in dense):
-        raise ValueError(f"dense layers must be distinct and within [0, {num_layers})")
+    # Every operator knob normalizes here instead of refusing, and says what it landed on.
+    # An out-of-range value costs a wasted arm; a refuse costs the whole batch, and the
+    # operator cannot adjust what would not run.
+    keep = bundle.keep_ratio
+    if keep_ratio is not None:
+        try:
+            asked = float(keep_ratio)
+        except (TypeError, ValueError):
+            asked = None
+        if asked is None or not math.isfinite(asked) or asked <= 0.0:
+            warnings.append(f"keep_ratio {keep_ratio!r} is not a positive number -- the bundle's "
+                            f"own {bundle.keep_ratio:g} is used instead, and the render goes ahead")
+        else:
+            keep = asked
+    dense, dropped = [], []
+    for layer in dense_layers:
+        try:
+            index = int(layer)
+        except (TypeError, ValueError):
+            dropped.append(repr(layer))
+            continue
+        if 0 <= index < num_layers:
+            dense.append(index)
+        else:
+            dropped.append(index)
+    dense = tuple(sorted(set(dense)))
+    if dropped:
+        warnings.append(f"dense_layers {[str(v) for v in dropped]} are not layer indices inside "
+                        f"[0, {num_layers}) -- dropped, those layers run as the plan says")
+    try:
+        chunk = int(head_chunk)
+    except (TypeError, ValueError):
+        chunk = int(heads)
+    if chunk < 1:
+        # Only the low end matters: range() refuses 0, and a chunk wider than the head
+        # count is harmless -- it just means one chunk. No upper gate, nya.
+        warnings.append(f"head_chunk {head_chunk!r} is below 1 -- clamped to 1; it only "
+                        f"bounds peak memory, never the result")
+        chunk = 1
     blocks: list[LayerAttention | None] = []
     for layer in range(num_layers):
         if layer in dense:
@@ -663,8 +743,8 @@ def build_table(
         # head anyway, so chunking a group costs nothing and bounds the gathered
         # key block, which is the only thing here that grows with the canvas.
         for shape, ids in plan.groups(layer % len(plan.head_shape)):
-            for start in range(0, ids.size, head_chunk):
-                part = ids[start : start + head_chunk]
+            for start in range(0, ids.size, chunk):
+                part = ids[start : start + chunk]
                 if part.size:
                     groups.append(HeadGroup.build(shape, part, grid, video_start))
         if not groups:
@@ -676,11 +756,29 @@ def build_table(
                 proj_k=bundle.proj_k[layer],
                 keep_ratio=keep,
                 dim=bundle.dim,
-                head_chunk=head_chunk,
+                head_chunk=chunk,
                 q_chunk=q_chunk,
             )
         )
-    return (
-        SparseTable(blocks=tuple(blocks), geometry=plan.geometry, note=note, keep_ratio=keep, dense_layers=dense),
-        warnings,
-    )
+    table = SparseTable(blocks=tuple(blocks), geometry=plan.geometry, note=note, keep_ratio=keep, dense_layers=dense)
+    # Say what the budget actually buys, never what keep_ratio literally spells: on a
+    # padded grid the two differ, and an operator bisecting a bad render needs the
+    # column number, not the ratio, to know whether a rung tested anything.
+    cover, need = table.coverage()
+    if cover >= 1.0:
+        if keep >= 1.0:
+            # The rung that bisects plumbing from prediction: every video query tile sees
+            # every video key tile, so the pixels must match the dense control at the same
+            # seed. Costs more than dense, and says so.
+            warnings.append(
+                f"keep_ratio {keep} keeps EVERY video key column: this run is a plumbing test, "
+                f"mathematically dense attention through the gather path (slower than dense)"
+            )
+    elif keep >= 1.0 or keep - cover > 0.02:
+        warnings.append(
+            f"keep_ratio {keep} reaches only {cover:.0%} of video key columns, not {keep:.0%} "
+            f"-- the budget is a fraction of the ideal dense work and this grid pads its "
+            f"tiles ({plan_padding(plan, grid):.0%} over the live grid); every column needs "
+            f"keep_ratio >= {need:.2f}"
+        )
+    return table, warnings

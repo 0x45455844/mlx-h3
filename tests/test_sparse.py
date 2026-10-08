@@ -360,16 +360,112 @@ def test_dense_layers_stay_dense_and_are_named_in_the_table():
     assert table.dense_layers == (1, 2) and table.sparse_layers == 2
     assert table.keep_ratio == 0.1 and notes == []
     kept, video_tiles = table.kept_tiles()
-    assert kept > 0 and video_tiles == 2, "the receipt names the budget it will actually pay"
+    group = table.blocks[0].groups[0]
+    # Globals are counted on BOTH sides so `kept` can never exceed the total it is
+    # drawn from; the old receipt added them to the wrong side and over-reported.
+    assert kept > 0 and video_tiles == group.n_video + group.n_global
+    assert kept <= video_tiles
 
 
-def test_keep_ratio_one_warns_that_sparse_is_a_no_op():
+def test_keep_ratio_one_says_whether_it_is_actually_dense():
+    """`keep 100%` is only a no-op when every COLUMN is reached -- prove which it is.
+
+    The budget is a fraction of the IDEAL dense work, so on a padded grid keep_ratio
+    1.0 still drops columns. The first version of this warning asserted "no-op" from
+    keep_ratio alone and an entire bisect ladder ran on the strength of it, with the
+    864x480/56f "wiring test" arm actually attending 42% of video key columns.
+    """
     table, notes = _build(sparse.PlanTable([_plan("16x9_t4")]), layers=1, keep_ratio=1.0)
-    assert any("no-op" in note for note in notes), "a lever that does nothing says so"
     assert table.blocks[0].keep_ratio == 1.0
+    assert table.coverage() == (1.0, 1.0), "this toy grid has no padding to dilute"
+    assert any("EVERY video key column" in note for note in notes), "a lever that does nothing says so"
+
+
+def test_a_padded_grid_dilutes_keep_and_says_so_in_columns():
+    """The trap: keep_ratio is a fraction of WORK, not of columns. Pin the numbers.
+
+    On the live 864x480/56f grid (17,15,27) the t37 plan's 8x4x4 shape pads to
+    (24,16,28) = 84 tiles for 54 tiles' worth of tokens. keep_ratio 1.0 therefore
+    buys 35 of 84 columns, and reaching all of them needs 2.42.
+    """
+    grid, shape = (17, 15, 27), sparse.TileShape(8, 4, 4)
+    video, n_ideal = shape.num_tiles(grid), math.ceil(math.prod(grid) / sparse.TILE)
+    assert (video, n_ideal) == (84, 54)
+    kept, cols = sparse.columns_kept(1.0, math.prod(grid), video)
+    assert kept < cols == 84, "keep_ratio 1.0 is NOT dense on a padded grid"
+    assert kept / cols == pytest.approx(0.417, abs=0.01)
+    assert sparse.dense_keep(math.prod(grid), video) == pytest.approx(2.42, abs=0.01)
+    assert sparse.columns_kept(sparse.dense_keep(math.prod(grid), video), math.prod(grid), video)[0] == cols
 
 
 def test_an_unsearched_canvas_runs_and_says_what_it_borrowed():
     table, notes = _build(sparse.PlanTable([_plan("16x9_t4")]), layers=1, width=864, height=480, grid=(7, 15, 27))
     assert table.blocks[0] is not None and notes, "warn, and go"
     assert "nearest latent_t" in notes[0]
+
+
+def test_no_operator_knob_can_refuse_a_render():
+    """Warn-and-go is the owner's rule and it outranks every range check (8 Oct).
+
+    Three separate gates once raised ValueError here -- GenerationConfig.__post_init__
+    on keep outside (0, 1], and build_table on dense_layers and on the head chunk. One
+    of them killed the plumbing rung at 2.5 with the render already paid for, which is
+    the exact failure the rule exists to prevent. Nothing in this call may raise, and
+    every knob that got normalized has to say so.
+    """
+    plans = sparse.PlanTable([_plan("16x9_t4")])
+    for keep in (0.0, -1.0, float("inf"), float("nan"), "junk", None, 2.5, 0.001):
+        table, notes = _build(plans, layers=1, keep_ratio=keep)
+        assert table.blocks[0] is not None, f"keep_ratio={keep!r} must still build and render"
+        assert table.keep_ratio > 0.0 and math.isfinite(table.keep_ratio), "it landed somewhere sane"
+    for dense in ((-1,), (999,), (-1, 999), ("x", 1), (1, 1)):
+        table, notes = _build(plans, layers=4, dense_layers=dense)
+        assert [block is None for block in table.blocks].count(True) <= 4
+        assert all(0 <= layer < 4 for layer in table.dense_layers), "out-of-range indices are dropped"
+    for chunk in (0, -3, 9999, "junk"):
+        table, notes = _build(plans, layers=1, head_chunk=chunk)
+        assert table.blocks[0] is not None
+        assert table.blocks[0].head_chunk >= 1, "only the low end is illegal; range() refuses 0"
+    _, notes = _build(plans, layers=4, keep_ratio=0.0, dense_layers=(-1, 999), head_chunk=0)
+    assert len(notes) >= 3, f"all three normalizations are named, got {notes}"
+
+
+def test_the_wiring_rung_reaches_every_column_and_the_config_accepts_it():
+    """keep > 1.0 must survive the config AND reach 100% of columns, or the gate is a lie."""
+    from mlx_h3.pipeline import GenerationConfig
+
+    config = GenerationConfig(prompt="a cat", sparse_bundle="x.safetensors", sparse_keep=2.5)
+    assert config.sparse_keep == 2.5, "the config may not clamp the wiring rung away"
+    table, notes = _build(sparse.PlanTable([_plan("16x9_t4")]), layers=1, keep_ratio=2.5)
+    assert table.coverage()[0] >= 1.0
+    assert any("EVERY video key column" in note for note in notes)
+
+
+def test_the_trunk_patch_site_flattens_sparse_output_correctly():
+    """The bug that made every sparse render noise, at every keep_ratio.
+
+    `sparse.attention` returns [seq, heads, dim] -- the layout of its own inputs. The
+    dense branch gets [1, heads, seq, dim] back from mx.fast.sdpa and transposes it. The
+    patch site copied the dense branch's transpose onto the ALREADY-correct [S,H,D],
+    producing [H,S,D], and reshape(seq, -1) on that buffer swaps the sequence and head
+    axes in silence because heads*seq*dim == seq*(heads*dim) and reshape cannot see it.
+
+    So the module was provably right (see the real-geometry drift of 3.5e-05 over 56
+    heads) and the pixels were still noise, identically at keep 0.1 and keep 2.5 -- the
+    scramble does not depend on the budget, which is the fingerprint to remember. This
+    test runs the REAL Attention module both ways, so it fails on the caller and not
+    just on sparse.py.
+    """
+    from mlx_h3.dit import Attention
+
+    mx.set_default_device(mx.cpu)
+    attn = Attention(HEADS * DIM, HEADS, DIM, 1e-6)
+    rng = np.random.default_rng(5)
+    x = mx.array(rng.standard_normal((SEQ, HEADS * DIM), dtype=np.float32))
+
+    dense = attn(x)
+    sparse_out = attn(x, sparse=_layer(keep_ratio=1.0))
+    mx.eval(dense, sparse_out)
+    assert dense.shape == sparse_out.shape == (SEQ, HEADS * DIM)
+    ratio = float(mx.abs(sparse_out - dense).max() / mx.abs(dense).mean())
+    assert ratio < 1e-4, f"patch site drifts {ratio:.3e} off dense at full coverage"
