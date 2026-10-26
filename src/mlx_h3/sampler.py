@@ -66,12 +66,23 @@ BASE_PROFILE = SamplingProfile(
     min_steps=1,
     max_steps=1000,
 )
+# mmcat fork patch (owner 26 Oct): the step range is ADVICE, not a wall. Upstream
+# shipped 4-8, which is the band the larryvrh adapters were TRAINED on — but it is a
+# claim about one adapter, enforced as a claim about every adapter, and it made a
+# 3-step student (TaoLiveAIGC/TaoMate-H3-FL2VA) unloadable at its own trained step
+# count. The range now only refuses what the solver cannot express; whether a step
+# count is GOOD for a given adapter is mmcat's warn-and-go business and, finally,
+# the pixels'. The hard wall stays in _shifted_sigmas: [1, 1000], because above 1000
+# the Comfy `simple` ladder emits duplicate sigmas and SigmaSchedule requires a
+# strictly decreasing grid. Verified on this checkout: denoise_euler and denoise both
+# return finite latents for every step count in [1, 1000] — no solver-side guard
+# exists, so a bad step count renders finite GARBAGE rather than an exception.
 TURBO_PROFILE = SamplingProfile(
     label="Turbo LoRA",
     solver=Solver.EULER,
     default_steps=6,
-    min_steps=4,
-    max_steps=8,
+    min_steps=1,
+    max_steps=100,
 )
 
 
